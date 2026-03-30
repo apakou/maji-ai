@@ -1,0 +1,14 @@
+sqlalchemy
+psycopg2-binary
+fastapi
+uvicorn[standard]
+python-dotenv
+twilio
+python-multipart
+cryptography
+Pillow
+fpdf2
+requests
+openai
+anthropic
+httpx
