@@ -8,7 +8,6 @@ import time
 import uuid
 from datetime import datetime
 
-import anthropic
 import httpx
 from dotenv import load_dotenv
 
@@ -16,6 +15,7 @@ import state
 from app.DB.database import SessionLocal, engine
 from app.DB.models import (
     Claim,
+    Goal,
     InventoryDeclaration,
     InventoryLog,
     Owner,
@@ -36,11 +36,61 @@ load_dotenv()
 
 domain_url = os.getenv("DOMAIN_URL")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 onboard_flow_id = os.getenv("ONBOARDING_FLOW_ID")
+
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_TEXT_MODEL = "gemini-3-flash-preview"
+GEMINI_VISION_MODEL = "gemini-3-flash-preview"
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def _extract_gemini_text(response_json: dict) -> str:
+    try:
+        parts = response_json["candidates"][0]["content"]["parts"]
+        return "".join(part.get("text", "") for part in parts).strip()
+    except Exception:
+        return ""
+
+
+async def _gemini_generate_content(
+    model: str,
+    user_parts: list,
+    system_prompt: str,
+    max_output_tokens: int,
+    timeout: float,
+) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    payload = {
+        "contents": [{"role": "user", "parts": user_parts}],
+        "generationConfig": {"maxOutputTokens": max_output_tokens, "temperature": 0.2},
+    }
+    if system_prompt:
+        payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{GEMINI_API_URL}/{model}:generateContent",
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+            )
+            if response.status_code == 429 and attempt < max_retries - 1:
+                retry_after = int(response.headers.get("Retry-After", 2 ** (attempt + 1)))
+                logger.warning(
+                    "gemini_rate_limited | attempt=%d/%d waiting=%ds",
+                    attempt + 1, max_retries, retry_after,
+                )
+                await asyncio.sleep(retry_after)
+                continue
+            response.raise_for_status()
+            return _extract_gemini_text(response.json())
+    raise RuntimeError("Gemini API rate limit exceeded after retries")
 
 _CANCELLABLE_STEPS = {
     "DAILY_AWAITING_INPUT_TYPE",
@@ -50,8 +100,8 @@ _CANCELLABLE_STEPS = {
     "AWAITING_STOCK_UPDATE",
     "AWAITING_INCIDENT_REPORT",
     "AWAITING_REPORT_PAYMENT",
-    "AWAITING_CAPS_Q1",
-    "AWAITING_CAPS_Q2",
+    "AWAITING_REVENUE",
+    "AWAITING_GOAL_INPUT",
     "AWAITING_FLOW",
     "AWAITING_PHOTO",
     "AWAITING_TEXT_STOCK",
@@ -79,7 +129,7 @@ async def step_1_greeting_button(phone: str, name: str = None):
         ),
         buttons=[{"id": "start_onboarding", "title": "Let's go!"}],
         header_image_url=f"{domain_url}/assets/greetings.jpg",
-        footer_text="Visbl",
+        footer_text="Maiji AI",
     )
 
     session_data = {"step": "AWAITING_BUTTON_CLICK"}
@@ -104,10 +154,10 @@ async def step_1_greeting_interactive_flow(phone: str):
             "Protect what you have built."
         ),
         flow_id=onboard_flow_id,
-        flow_cta="Show me how",
+        flow_cta="Let's start",
         flow_token=flow_token,
         screen="WELCOME",
-        footer_text="Visbl·",
+        footer_text="Maiji AI",
     )
     logger.info("onboarding_step_1_flow_complete | phone=%s", phone)
 
@@ -129,7 +179,7 @@ _CATEGORY_LABELS = {c["id"]: c["title"] for c in _CATEGORIES}
 async def step_1b_ask_name(phone: str):
     send_text(
         phone,
-        "Before we start setting your goals, let me get to know your shop. 🏪\n\n"
+        "Before we start setting your goals, let me get to know your shop. 🤖\n\n"
         "What is your name?\n\n"
         "_Type *cancel* at any time to go back to the start._",
     )
@@ -143,7 +193,7 @@ async def step_1b_skip_name_ask_shop(phone: str):
     """
     send_text(
         phone,
-        "Before we start building your record, let me get to know your shop. 🏪\n\n"
+        "Before we start building your record, let me get to know your shop. 🤖\n\n"
         "What is your shop called?\n\n"
         "_Type *cancel* at any time to go back to the start._",
     )
@@ -170,9 +220,9 @@ async def step_1d_handle_shop(phone: str, text: str, session: dict):
     state.sessions[phone] = session
     send_text(
         phone,
-        f"*{shop}* - nice! 🏪\n\n"
+        f"*{shop}* - nice! 🤖\n\n"
         "Where is your shop located?\n\n"
-        "Example: Makola Market, Circle, Kumasi Central Market",
+        "Example: Osu, Labone, East Legon...",
     )
     state.sessions[phone]["step"] = "AWAITING_LOCATION"
 
@@ -194,7 +244,7 @@ async def step_1e_handle_location(phone: str, text: str, session: dict):
                 "rows": [{"id": c["id"], "title": c["title"]} for c in _CATEGORIES],
             }
         ],
-        footer_text="Visbl · Shop setup",
+        footer_text="Maiji AI · Shop setup",
     )
     state.sessions[phone]["step"] = "AWAITING_CATEGORY"
 
@@ -221,7 +271,8 @@ async def step_1f_handle_category(phone: str, row_id: str, session: dict):
     send_text(
         phone,
         f"Perfect! *{shop}* is all set up. 🎉\n\n"
-        f"Now let's build your stock record, {name}.",
+        f"Now let's record your first stock, {name}. "
+        "This helps me give you smarter advice about reaching your goals.",
     )
     await step_2_ask_for_photo(phone)
 
@@ -253,11 +304,11 @@ async def step_2_ask_for_photo(phone: str):
                         "title": "📖 Log book page",
                         "description": "Photo of your written records",
                     },
-                    {
-                        "id": "input_voice",
-                        "title": "🎤 Voice note",
-                        "description": "Speak your stock list",
-                    },
+                    # {
+                    #     "id": "input_voice",
+                    #     "title": "🎤 Voice note",
+                    #     "description": "Speak your stock list",
+                    # },
                     {
                         "id": "input_text",
                         "title": "✍️ Type it out",
@@ -266,7 +317,7 @@ async def step_2_ask_for_photo(phone: str):
                 ],
             }
         ],
-        footer_text="Visbl·",
+        footer_text="Maiji AI",
     )
     session = state.sessions.get(phone, {})
     session["step"] = "AWAITING_INPUT_TYPE"
@@ -440,10 +491,10 @@ async def _step_3_process_images(phone: str, messages: list):
         )
         return
 
-    # ── CHANGED: pull owner context before calling Claude ──
+    # Pull owner context before calling Gemini
     previous_logs, record_strength, restart_cap = _get_owner_context(phone)
 
-    result = await step_4_parse_inventory_with_claude(
+    result = await step_4_parse_inventory_with_gemini(
         phone,
         image_b64s,
         previous_logs=previous_logs,
@@ -453,13 +504,21 @@ async def _step_3_process_images(phone: str, messages: list):
 
     inventory = result.get("inventory", [])
     if not inventory:
-        logger.warning("onboarding_step_3_no_inventory | phone=%s", phone)
+        api_error = result.get("_api_error", False)
+        logger.warning("onboarding_step_3_no_inventory | phone=%s api_error=%s", phone, api_error)
         state.sessions[phone]["step"] = "AWAITING_PHOTO"
-        send_text(
-            phone,
-            "I could not read the stock clearly from those photos. "
-            "Please try again with clearer, well-lit pictures. 📸",
-        )
+        if api_error:
+            send_text(
+                phone,
+                "I ran into a technical problem analysing your photo. "
+                "Please try sending it again in a moment. 🙏",
+            )
+        else:
+            send_text(
+                phone,
+                "I could not read the stock clearly from those photos. "
+                "Please try again with clearer, well-lit pictures. 📸",
+            )
         return
 
     # Store record strength in session
@@ -493,7 +552,7 @@ async def step_3_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "input_text", "title": "✍️ Type instead"},
                 {"id": "input_photo", "title": "📸 Send a photo"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         session["step"] = "AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -515,7 +574,7 @@ async def step_3_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "input_text", "title": "✍️ Type instead"},
                 {"id": "input_photo", "title": "📸 Send a photo"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         session["step"] = "AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -529,7 +588,7 @@ async def step_3_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "input_text", "title": "✍️ Type instead"},
                 {"id": "input_photo", "title": "📸 Send a photo"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         session["step"] = "AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -554,7 +613,7 @@ async def step_3_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "input_text", "title": "✍️ Type instead"},
                 {"id": "input_photo", "title": "📸 Send a photo"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         session["step"] = "AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -575,7 +634,7 @@ async def step_3_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "input_text", "title": "✍️ Type instead"},
                 {"id": "input_photo", "title": "📸 Send a photo"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         session["step"] = "AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -600,7 +659,7 @@ async def step_3_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "input_text", "title": "✍️ Type instead"},
                 {"id": "input_photo", "title": "📸 Send a photo"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         session["step"] = "AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -674,12 +733,12 @@ def _get_owner_context(phone: str) -> tuple:
 
 
 # ─────────────────────────────────────────────
-# STEP 4 — Claude Vision + Audit Engine
+# STEP 4 — Gemini Vision + Audit Engine
 # ── CHANGED: returns dict instead of list ──
 # ── CHANGED: context-aware mismatch logic ──
 # ── CHANGED: uses Sonnet for full audit ──
 # ─────────────────────────────────────────────
-async def step_4_parse_inventory_with_claude(
+async def step_4_parse_inventory_with_gemini(
     phone: str,
     image_b64s: list,
     previous_logs: list = None,
@@ -742,9 +801,9 @@ async def step_4_parse_inventory_with_claude(
 You help informal container shop traders in Ghana build
 verified digital inventory records for disaster protection.
 
-You know Circle market, Makola, and Osu well.
+You know all the neighborhoods in Ghana well.
 You understand how traders work — waybills, stock runs,
-MoMo payments, SUSU groups, market days.
+MoMo payments, market days.
 
 ━━━━━━━━━━━━━━━━━━
 TRADER CONTEXT
@@ -859,46 +918,32 @@ No markdown. No backticks. Raw JSON only.
 
     raw = None
     try:
-        claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-
-        image_blocks = [
+        user_parts = [
+            *[
+                {
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": img_b64,
+                    }
+                }
+                for img_b64 in image_b64s
+            ],
             {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": img_b64,
-                },
-            }
-            for img_b64 in image_b64s
+                "text": (
+                    "Analyse this shop photo. "
+                    "Compare against the previous logs above. "
+                    "Return JSON only."
+                )
+            },
         ]
 
-        response = await asyncio.wait_for(
-            claude.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,  # Increased from 1024 to prevent truncation
-                system=system_prompt,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            *image_blocks,
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Analyse this shop photo. "
-                                    "Compare against the previous logs above. "
-                                    "Return JSON only."
-                                ),
-                            },
-                        ],
-                    }
-                ],
-            ),
-            timeout=45.0,  # Increased timeout for longer generation
+        raw = await _gemini_generate_content(
+            model=GEMINI_VISION_MODEL,
+            user_parts=user_parts,
+            system_prompt=system_prompt,
+            max_output_tokens=4096,
+            timeout=45.0,
         )
-
-        raw = response.content[0].text.strip()
         raw = re.sub(r"```json|```", "", raw).strip()
 
         try:
@@ -939,7 +984,7 @@ No markdown. No backticks. Raw JSON only.
             phone,
             time.perf_counter() - t0,
         )
-        return {}
+        return {"_api_error": True}
     except json.JSONDecodeError as e:
         logger.error(
             "claude_vision_json_error | phone=%s error=%s raw=%s",
@@ -947,14 +992,18 @@ No markdown. No backticks. Raw JSON only.
             e,
             raw,
         )
-        return {}
+        return {"_api_error": True}
     except Exception:
         logger.exception(
             "claude_vision_error | phone=%s elapsed=%.2fs",
             phone,
             time.perf_counter() - t0,
         )
-        return {}
+        return {"_api_error": True}
+
+
+# Backward-compatible alias for existing imports
+step_4_parse_inventory_with_claude = step_4_parse_inventory_with_gemini
 
 
 async def step_4_trigger_verification(
@@ -1020,14 +1069,14 @@ async def step_4_trigger_verification(
     elif verification_status == "mismatch":
         badge = "⚠️ Something looks different"
     else:
-        badge = "📋 Recorded by Visbl AI"
+        badge = "📋 Recorded by Maiji AI"
 
     # ─────────────────────────────────────────────
     # Build short summary — kept well under 1024
     # chars for the interactive message body
     # ─────────────────────────────────────────────
     summary = (
-        f"Visbl RECEIPT 🧾\n"
+        f"Maiji AI RECEIPT 🧾\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Date: {datetime.now().strftime('%d %b %Y')}\n"
         f"Est. Value: GHS {total_value:,}\n"
@@ -1070,7 +1119,7 @@ async def step_4_trigger_verification(
             flow_token=flow_token,
             screen="INVENTORY_REVIEW",
             prefill_data={"inventory": inventory},
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         logger.info("onboarding_step_4_flow_sent | phone=%s", phone)
 
@@ -1086,7 +1135,7 @@ async def step_4_trigger_verification(
                 {"id": "inventory_correct", "title": "Yes, correct ✅"},
                 {"id": "inventory_edit", "title": "No, edit it"},
             ],
-            footer_text="Visbl·",
+            footer_text="Maiji AI",
         )
         logger.info("onboarding_step_4_buttons_sent | phone=%s", phone)
 
@@ -1126,15 +1175,13 @@ async def step_4b_handle_correction(phone: str, text: str, session: dict):
     """
 
     try:
-        claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        response = await claude.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": prompt}],
+        raw = await _gemini_generate_content(
+            model=GEMINI_TEXT_MODEL,
+            user_parts=[{"text": prompt}],
+            system_prompt=system_prompt,
+            max_output_tokens=1024,
+            timeout=30.0,
         )
-
-        raw = response.content[0].text.strip()
         raw = re.sub(r"```json|```", "", raw).strip()
         updated_inventory = json.loads(raw)
 
@@ -1192,135 +1239,103 @@ async def step_5_handle_flow_submission(phone: str, flow_response: dict, session
         phone,
         len(confirmed_inventory),
     )
-    await step_5b_ask_stock_value(phone)
+    await step_5b_ask_monthly_revenue(phone)
 
 
-async def step_5b_ask_stock_value(phone: str):
+async def step_5b_ask_monthly_revenue(phone: str):
     logger.info("onboarding_step_5b_start | phone=%s", phone)
     send_text(
         phone,
-        "Almost done! Two quick questions to match you with the right Shield. 🛡️\n\n"
-        "1️⃣ What is the *total value* of all the stock in your shop right now?\n\n"
-        "Reply with the amount in Ghana Cedis. Example: *50,000*\n\n"
-        "Not sure? Type *estimate* and I will work it out from your stock.",
+        "Almost there! Two quick questions to set your goal. 🎯\n\n"
+        "1️⃣ How much do you earn from your shop in a typical month?\n\n"
+        "Reply with the amount in Ghana Cedis. Example: *3000*\n\n"
+        "Not sure? Type *skip* and I will estimate from your stock.",
     )
-    state.sessions[phone]["step"] = "AWAITING_CAPS_Q1"
+    state.sessions[phone]["step"] = "AWAITING_REVENUE"
 
 
-async def step_5b_handle_stock_value(phone: str, text: str, session: dict):
-    logger.info("onboarding_step_5b_response | phone=%s raw_input=%s", phone, text)
-    if text.strip().lower() == "estimate":
+# Keep old name as alias so existing sessions in AWAITING_CAPS_Q1 still work
+step_5b_ask_stock_value = step_5b_ask_monthly_revenue
+
+
+async def step_5b_handle_monthly_revenue(phone: str, text: str, session: dict):
+    logger.info("onboarding_step_5b_revenue | phone=%s raw_input=%s", phone, text)
+    if text.strip().lower() in ("skip", "estimate"):
         inventory = session.get("inventory", [])
-        estimated = (
-            sum(
-                i.get("qty", 0) * i.get("price", 0) for i in inventory if i.get("price")
-            )
-            if inventory
-            else 0
+        estimated = sum(
+            i.get("qty", 0) * i.get("price", 0) for i in inventory if i.get("price")
         )
-        if estimated > 0:
-            formatted = f"GHS {estimated:,.0f}"
-            session["stock_value"] = float(estimated)
-            state.sessions[phone] = session
+        session["monthly_revenue"] = float(estimated) if estimated > 0 else 0
+        state.sessions[phone] = session
+    else:
+        cleaned = "".join(filter(str.isdigit, text))
+        if not cleaned:
             send_text(
                 phone,
-                f"I will use *{formatted}* as your total stock value. ✅\n\n"
-                "2️⃣ If a fire or flood hit your shop tomorrow, "
-                "how much money would you need to buy stock and open again?\n\n"
-                "Reply with the amount in Ghana Cedis. Example: *10,000*\n\n"
-                "Not sure? Type *estimate* and I will use half your stock value.",
+                "Please reply with a number. Example: *3000*\n\n"
+                "How much do you earn per month?\n\n"
+                "Not sure? Type *skip*.",
             )
-            state.sessions[phone]["step"] = "AWAITING_CAPS_Q2"
-        else:
-            send_text(
-                phone,
-                "I do not have enough price information to estimate. "
-                "Please type your best guess in Ghana Cedis. Example: *50,000*",
-            )
-        return
-    cleaned = "".join(filter(str.isdigit, text))
-    if not cleaned:
-        logger.warning("onboarding_step_5b_invalid_input | phone=%s", phone)
-        send_text(
-            phone,
-            "Please reply with a number. Example: *50,000*\n\n"
-            "What is the total value of all the stock in your shop?\n\n"
-            "Not sure? Type *estimate*.",
+            return
+        session["monthly_revenue"] = float(cleaned)
+        state.sessions[phone] = session
+        logger.info(
+            "onboarding_step_5b_revenue_saved | phone=%s value=%s", phone, cleaned
         )
-        return
-    session["stock_value"] = float(cleaned)
-    state.sessions[phone] = session
-    logger.info(
-        "onboarding_step_5b_stock_value_saved | phone=%s value=%s",
-        phone,
-        cleaned,
-    )
+
     send_text(
         phone,
-        "2️⃣ If a fire or flood hit your shop tomorrow, "
-        "how much money would you need to buy stock and open again?\n\n"
-        "Reply with the amount in Ghana Cedis. Example: *10,000*\n\n"
-        "Not sure? Type *estimate* and I will use half your stock value.",
+        "2️⃣ What is one goal you are working toward? 🎯\n\n"
+        "Tell me in your own words. Examples:\n\n"
+        '_"I want my son to attend ASHESI next year. It will cost 60,000 cedis a semester."_\n\n'
+        '_"I want to buy a second fridge for my shop by December."_\n\n'
+        '_"I want to build a house in 3 years."_',
     )
-    state.sessions[phone]["step"] = "AWAITING_CAPS_Q2"
+    state.sessions[phone]["step"] = "AWAITING_GOAL_INPUT"
 
 
-async def step_5c_handle_restart_cap(phone: str, text: str, session: dict):
-    logger.info("onboarding_step_5c_response | phone=%s raw_input=%s", phone, text)
-    if text.strip().lower() == "estimate":
-        stock_value = session.get("stock_value", 0)
-        estimated = round(stock_value * 0.5, -3)
-        if estimated <= 0:
-            estimated = 5000
-        formatted = f"GHS {estimated:,.0f}"
-        send_text(
-            phone,
-            f"I will use *{formatted}* as your Restart Cap — roughly half your stock value.\n\n"
-            "You can type a different amount if you prefer.",
-        )
-        session["restart_cap"] = float(estimated)
-        state.sessions[phone] = session
-        send_typing_indicator(phone, "")
-        await step_6_complete_onboarding(phone, session)
-        return
-    cleaned = "".join(filter(str.isdigit, text))
-    if not cleaned:
-        logger.warning("onboarding_step_5c_invalid_input | phone=%s", phone)
-        send_text(
-            phone,
-            "Please reply with a number. Example: *10,000*\n\n"
-            "How much would you need to restock and reopen after a flood or fire?\n\n"
-            "Not sure? Type *estimate*.",
-        )
-        return
-    session["restart_cap"] = float(cleaned)
+# Keep old name as alias so existing sessions in AWAITING_CAPS_Q1 still work
+step_5b_handle_stock_value = step_5b_handle_monthly_revenue
+
+
+async def step_5c_handle_goal_input(phone: str, text: str, session: dict):
+    logger.info("onboarding_step_5c_goal | phone=%s text=%r", phone, text[:80])
+    session["goal_raw"] = text
     state.sessions[phone] = session
-    logger.info(
-        "onboarding_step_5c_restart_cap_saved | phone=%s value=%s",
-        phone,
-        cleaned,
-    )
     send_typing_indicator(phone, "")
+    goal_data = await _parse_goal_with_gemini(text)
+    session["goal_data"] = goal_data
+    state.sessions[phone] = session
     await step_6_complete_onboarding(phone, session)
 
 
+# Keep old name as alias so existing sessions in AWAITING_CAPS_Q2 still work
+step_5c_handle_restart_cap = step_5c_handle_goal_input
+
+
 # ─────────────────────────────────────────────
-# STEP 6 — Tier logic + confirmation
+# STEP 6 — Save to DB + Goal advice
 # ─────────────────────────────────────────────
 def calculate_tier(restart_cap: float) -> dict:
-    # Phase 1: Single tier for all traders
-    return {"tier": "Visbl Shield", "price": "GHS 50/month"}
+    # Kept for backward compatibility
+    return {"tier": "Maiji AI", "price": "Free"}
 
 
 async def step_6_complete_onboarding(phone: str, session: dict):
     logger.info("onboarding_step_6_start | phone=%s", phone)
-    tier = calculate_tier(session["restart_cap"])
-    session["tier"] = tier
 
-    # Phase 1: Fixed GHS 50 (5000 pesewas)
-    _TIER_PREMIUM_PESEWAS = {
-        "Visbl Shield": 5000,
-    }
+    goal_data = session.get("goal_data", {})
+    monthly_revenue = session.get("monthly_revenue", 0)
+    goal_raw = session.get("goal_raw", "")
+
+    # Calculate monthly savings required
+    target_amount = goal_data.get("target_amount_ghs")
+    target_date = goal_data.get("target_date", "")
+    monthly_required = None
+    if target_amount and target_date:
+        months = _estimate_months(target_date)
+        if months and months > 0:
+            monthly_required = round(float(target_amount) / months, 2)
 
     try:
         db = SessionLocal()
@@ -1338,29 +1353,30 @@ async def step_6_complete_onboarding(phone: str, session: dict):
             db.add(
                 InventoryDeclaration(
                     owner_id=owner.id,
-                    total_stock_value_ghs=session["stock_value"],
-                    item_breakdown_json=json.dumps(session["inventory"]),
+                    total_stock_value_ghs=None,
+                    item_breakdown_json=json.dumps(session.get("inventory", [])),
                 )
             )
-            db.add(
-                Policy(
-                    owner_id=owner.id,
-                    status="pending",
-                    premium_pesewas=_TIER_PREMIUM_PESEWAS.get(tier["tier"], 5000),
-                    payout_cap_pesewas=int(session["restart_cap"] * 100),
+            if goal_raw:
+                db.add(
+                    Goal(
+                        owner_id=owner.id,
+                        goal_text=goal_raw,
+                        goal_category=goal_data.get("goal_category", "other"),
+                        target_amount_ghs=target_amount,
+                        monthly_required_ghs=monthly_required,
+                        target_date=target_date,
+                        progress_ghs=0,
+                        is_active=1,
+                    )
                 )
-            )
             db.commit()
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
-        logger.info(
-            "onboarding_step_6_db_write_success | phone=%s tier=%s",
-            phone,
-            tier["tier"],
-        )
+        logger.info("onboarding_step_6_db_write_success | phone=%s", phone)
     except Exception:
         logger.exception("onboarding_step_6_db_write_error | phone=%s", phone)
         send_text(
@@ -1369,44 +1385,240 @@ async def step_6_complete_onboarding(phone: str, session: dict):
         )
         return
 
-    restart_formatted = f"GHS {int(session['restart_cap']):,}"
-    stock_formatted = f"GHS {int(session['stock_value']):,}"
     name = session.get("name", "")
     shop = session.get("shop_name", "your shop")
+    goal_summary = goal_data.get("goal_summary") or goal_raw[:80] or "your goal"
+
+    # Generate personalised AI advice
+    advice = await _generate_goal_advice(
+        phone=phone,
+        name=name,
+        shop_name=shop,
+        category=session.get("category", "General Goods"),
+        location=session.get("location", "Ghana"),
+        monthly_revenue=monthly_revenue,
+        goal_data=goal_data,
+    )
 
     send_text(
         phone,
-        f"{'*' + name + '*, you' if name else 'You'} are now on Visbl! 🎉\n\n"
-        f"*{shop}* has been registered with:\n"
-        f"• Stock value: *{stock_formatted}*\n"
-        f"• Restart Cap: *{restart_formatted}*\n"
-        f"• Plan: *{tier['tier']}* — {tier['price']}\n\n"
-        f"*Your record is not protected yet* - but it starts building from today.\n\n"
-        f"Every day you log, your proof gets stronger. "
-        f"When something goes wrong, that proof is what gets you paid. 📋",
+        f"{'*' + name + '*, you are' if name else 'You are'} now on Maiji AI! 🎉\n\n"
+        f"*{shop}* has been set up.\n"
+        f"🎯 Goal: *{goal_summary}*\n\n"
+        f"Here is what I recommend:\n\n"
+        f"{advice}",
     )
     send_reply_buttons(
         to=phone,
         body_text=(
-            f"Here is how protection works:\n\n"
-            f"1️⃣ Build your record daily\n"
-            f"2️⃣ Pay your monthly premium\n"
-            f"3️⃣ Get verified coverage commitment 🛡️\n\n"
-            f"Premium: *{tier['price']}*"
+            "Every day you log your stock, I get smarter about your revenue — "
+            "and closer to helping you hit that goal. 📋\n\n"
+            "What would you like to do next?"
         ),
         buttons=[
-            {"id": "pay_now", "title": "Activate now 🔒"},
-            {"id": "pay_later", "title": "Remind me later"},
+            {"id": "menu_log", "title": "Log my stock today 📦"},
+            {"id": "menu_goal", "title": "See my goal 🎯"},
         ],
-        footer_text="Visbl · Cancel anytime",
+        footer_text="Maiji AI",
     )
-    state.sessions[phone]["step"] = "AWAITING_PAYMENT_DECISION"
-    logger.info(
-        "onboarding_complete | phone=%s tier=%s restart_cap=%s",
-        phone,
-        tier["tier"],
-        session["restart_cap"],
+    state.sessions[phone]["step"] = "IDLE"
+    logger.info("onboarding_complete | phone=%s goal=%s", phone, goal_summary)
+
+
+# ─────────────────────────────────────────────
+# GOAL HELPERS
+# ─────────────────────────────────────────────
+def _estimate_months(target_date: str) -> int:
+    """Convert a natural-language date string to an integer month count."""
+    if not target_date:
+        return 12
+    lower = target_date.lower()
+    if any(x in lower for x in ("next year", "1 year", "one year")):
+        return 12
+    if any(x in lower for x in ("2 year", "two year")):
+        return 24
+    if any(x in lower for x in ("3 year", "three year")):
+        return 36
+    if any(x in lower for x in ("6 month", "six month", "next semester", "semester")):
+        return 6
+    if any(x in lower for x in ("3 month", "three month")):
+        return 3
+    nums = re.findall(r"\d+", target_date)
+    if nums:
+        n = int(nums[0])
+        if "year" in lower:
+            return n * 12
+        if "month" in lower:
+            return n
+    return 12
+
+
+async def _parse_goal_with_gemini(text: str) -> dict:
+    """Use Gemini to parse a free-text goal into structured fields."""
+    system = """You are a financial goal parser for a market trader in Ghana.
+Extract the goal details from the user's message.
+Return ONLY raw JSON (no markdown, no backticks):
+{
+  "goal_category": "education|health|housing|business|other",
+  "target_amount_ghs": number or null,
+  "target_date": "string describing when (e.g. next year, in 6 months)" or null,
+  "goal_summary": "one short plain-English summary of the goal"
+}
+
+Examples:
+Input: "I want my son to attend ASHESI next year. This will cost me 60000 cedis a semester."
+Output: {"goal_category": "education", "target_amount_ghs": 60000, "target_date": "next year", "goal_summary": "Son's first semester fees at ASHESI University"}
+
+Input: "I want to build a house in 3 years"
+Output: {"goal_category": "housing", "target_amount_ghs": null, "target_date": "3 years", "goal_summary": "Build a house in 3 years"}"""
+
+    try:
+        raw = await _gemini_generate_content(
+            model=GEMINI_TEXT_MODEL,
+            user_parts=[{"text": text}],
+            system_prompt=system,
+            max_output_tokens=512,
+            timeout=15.0,
+        )
+        raw = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
+        logger.info("parse_goal_success | category=%s", data.get("goal_category"))
+        return data
+    except Exception:
+        logger.exception("parse_goal_error | text=%r", text[:80])
+        return {
+            "goal_category": "other",
+            "target_amount_ghs": None,
+            "target_date": None,
+            "goal_summary": text[:100],
+        }
+
+
+async def _generate_goal_advice(
+    phone: str,
+    name: str,
+    shop_name: str,
+    category: str,
+    location: str,
+    monthly_revenue: float,
+    goal_data: dict,
+) -> str:
+    """Generate personalised revenue + stocking advice toward the owner's goal."""
+    target_amount = goal_data.get("target_amount_ghs")
+    target_date = goal_data.get("target_date", "")
+    goal_summary = goal_data.get("goal_summary", "your goal")
+
+    system = f"""You are Maiji AI — a warm, friendly financial advisor for informal market traders in Ghana.
+You know Circle market, Makola, Osu, and Accra neighbourhoods well.
+Speak simply, like a trusted friend. Use market language (cedis, MoMo, stall, customers).
+
+Trader details:
+- Name: {name or "the trader"}
+- Shop: {shop_name}
+- Location: {location}
+- Products sold: {category}
+- Monthly revenue: {"GHS " + f"{monthly_revenue:,.0f}" if monthly_revenue else "not yet known"}
+- Goal: {goal_summary}
+- Target amount: {"GHS " + f"{float(target_amount):,.0f}" if target_amount else "not specified"}
+- Timeline: {target_date or "not specified"}
+
+Your task:
+1. If target amount AND timeline are known, calculate how much they need to save per month.
+   Compare that to their revenue and say whether it is achievable.
+2. Suggest 1-2 specific products they could stock to boost revenue, based on their
+   product category, location, and goal category.
+3. Keep the advice to 3-5 sentences max. Warm, direct, actionable.
+4. Return ONLY the advice text. No JSON. No bullet points. No headers."""
+
+    try:
+        return await _gemini_generate_content(
+            model=GEMINI_TEXT_MODEL,
+            user_parts=[{"text": "Give me personalised advice for my goal."}],
+            system_prompt=system,
+            max_output_tokens=512,
+            timeout=20.0,
+        )
+    except Exception:
+        logger.exception("generate_goal_advice_error | phone=%s", phone)
+        if target_amount and monthly_revenue and monthly_revenue > 0:
+            months = _estimate_months(target_date)
+            monthly_needed = round(float(target_amount) / months, -2)
+            return (
+                f"To reach your goal, aim to save around GHS {monthly_needed:,.0f} every month. "
+                f"You are currently earning GHS {monthly_revenue:,.0f} — keep logging daily "
+                f"so I can track your progress and give you better advice. 💪"
+            )
+        return (
+            "Keep logging your stock daily — every entry helps me track your revenue "
+            "and give you better advice toward your goal. 💪"
+        )
+
+
+async def _send_goal_status(phone: str, owner) -> None:
+    """Show the owner's active goal with fresh AI advice."""
+    if not owner:
+        send_text(phone, "I could not find your shop record. Please type *hi* to start.")
+        return
+
+    db = SessionLocal()
+    try:
+        goal = (
+            db.query(Goal)
+            .filter(Goal.owner_id == owner.id, Goal.is_active == 1)
+            .order_by(Goal.id.desc())
+            .first()
+        )
+    except Exception:
+        logger.exception("goal_status_db_error | phone=%s", phone)
+        goal = None
+    finally:
+        db.close()
+
+    session = state.sessions.get(phone, {})
+
+    if not goal:
+        send_text(
+            phone,
+            "You have not set a goal yet. 🎯\n\n"
+            "Tell me what you are working toward and I will help you plan it.\n\n"
+            "Example:\n"
+            '_"I want my son to attend ASHESI next year — 60,000 cedis a semester."_',
+        )
+        session["step"] = "AWAITING_GOAL_INPUT"
+        state.sessions[phone] = session
+        return
+
+    target = float(goal.target_amount_ghs or 0)
+    monthly = float(goal.monthly_required_ghs or 0)
+    progress = float(goal.progress_ghs or 0)
+
+    lines = [
+        f"🎯 *Your Goal*\n━━━━━━━━━━━━━━━━━━\n{goal.goal_text or goal.goal_category}"
+    ]
+    if target:
+        lines.append(f"Target: *GHS {target:,.0f}*")
+    if monthly:
+        lines.append(f"Monthly savings needed: *GHS {monthly:,.0f}*")
+    if progress and target:
+        pct = min(100, int(progress / target * 100))
+        lines.append(f"Progress: GHS {progress:,.0f} ({pct}% there)")
+
+    advice = await _generate_goal_advice(
+        phone=phone,
+        name=owner.name or "",
+        shop_name=owner.shop_name or "your shop",
+        category=owner.category or "General Goods",
+        location=owner.location or "Ghana",
+        monthly_revenue=0,
+        goal_data={
+            "goal_category": goal.goal_category,
+            "target_amount_ghs": target or None,
+            "target_date": goal.target_date,
+            "goal_summary": goal.goal_text or goal.goal_category,
+        },
     )
+    lines.append(f"\n💡 {advice}")
+    send_text(phone, "\n".join(lines))
 
 
 # ─────────────────────────────────────────────
@@ -1423,7 +1635,7 @@ async def send_daily_checkin(phone: str):
             {"id": "checkin_update", "title": "Update my stock 📦"},
             {"id": "checkin_problem", "title": "Had a problem ⚠️"},
         ],
-        footer_text="Visbl · Your daily record",
+        footer_text="Maiji AI · Your daily record",
     )
     state.sessions[phone] = state.sessions.get(phone, {})
     state.sessions[phone]["step"] = "DAILY_CHECKIN"
@@ -1465,6 +1677,66 @@ async def handle_existing_user(phone: str, message: dict, owner):
             ],
         )
         session["step"] = "AWAITING_DELETE_CONFIRM"
+        state.sessions[phone] = session
+        return
+
+    if step == "AWAITING_GOAL_INPUT":
+        if msg_type != "text" or not text:
+            send_text(phone, "Please describe your goal in a message.\n\nExample: _\"I want to build a house in 2 years.\"_")
+            return
+        session["goal_raw"] = text
+        state.sessions[phone] = session
+        goal_data = await _parse_goal_with_gemini(text)
+        # Persist updated goal
+        db = SessionLocal()
+        try:
+            existing_goal = (
+                db.query(Goal)
+                .filter(Goal.owner_id == owner.id, Goal.is_active == 1)
+                .order_by(Goal.id.desc())
+                .first()
+            )
+            monthly_revenue = float(session.get("monthly_revenue", 0) or 0)
+            target_amount = goal_data.get("target_amount_ghs")
+            target_date = goal_data.get("target_date", "")
+            months = _estimate_months(target_date) if target_date else 12
+            monthly_needed = round(float(target_amount) / months, -2) if target_amount else None
+            if existing_goal:
+                existing_goal.goal_text = text
+                existing_goal.goal_category = goal_data.get("goal_category", "other")
+                existing_goal.target_amount_ghs = target_amount
+                existing_goal.monthly_required_ghs = monthly_needed
+                existing_goal.target_date = target_date
+            else:
+                new_goal = Goal(
+                    owner_id=owner.id,
+                    goal_text=text,
+                    goal_category=goal_data.get("goal_category", "other"),
+                    target_amount_ghs=target_amount,
+                    monthly_required_ghs=monthly_needed,
+                    target_date=target_date,
+                )
+                db.add(new_goal)
+            db.commit()
+        except Exception:
+            logger.exception("goal_update_error | phone=%s", phone)
+            db.rollback()
+        finally:
+            db.close()
+        advice = await _generate_goal_advice(
+            phone=phone,
+            name=owner.name or "",
+            shop_name=owner.shop_name or "your shop",
+            category=owner.category or "General Goods",
+            location=owner.location or "Ghana",
+            monthly_revenue=float(session.get("monthly_revenue", 0) or 0),
+            goal_data=goal_data,
+        )
+        send_text(
+            phone,
+            f"🎯 *Goal saved!*\n\n{goal_data.get('goal_summary', text[:80])}\n\n💡 {advice}",
+        )
+        session["step"] = "IDLE"
         state.sessions[phone] = session
         return
 
@@ -1513,7 +1785,7 @@ async def handle_existing_user(phone: str, message: dict, owner):
                     {"id": "pay_now", "title": "Activate now 🔒"},
                     {"id": "pay_later", "title": "Remind me later"},
                 ],
-                footer_text="Visbl · Cancel anytime",
+                footer_text="Maiji AI · Cancel anytime",
             )
         return
 
@@ -1581,7 +1853,7 @@ async def handle_existing_user(phone: str, message: dict, owner):
                     {"id": "daily_voice", "title": "🎤 Try voice again"},
                     {"id": "daily_text", "title": "✍️ Type instead"},
                 ],
-                footer_text="Visbl · Type *cancel* to stop",
+                footer_text="Maiji AI · Type *cancel* to stop",
             )
         return
 
@@ -1648,17 +1920,8 @@ async def handle_existing_user(phone: str, message: dict, owner):
         session["step"] = "AWAITING_REPORT_PAYMENT"
         state.sessions[phone] = session
         return
-    if button_id == "menu_activate":
-        send_reply_buttons(
-            to=phone,
-            body_text="Ready to activate your Shield? 🛡️\n\nYour first premium locks in your protection.",
-            buttons=[
-                {"id": "pay_now", "title": "Activate now 🔒"},
-                {"id": "pay_later", "title": "Not yet"},
-            ],
-        )
-        session["step"] = "AWAITING_PAYMENT_DECISION"
-        state.sessions[phone] = session
+    if button_id == "menu_goal":
+        await _send_goal_status(phone, owner)
         return
     if button_id == "menu_delete":
         send_reply_buttons(
@@ -1819,13 +2082,13 @@ async def _send_shop_report(phone: str, owner):
         )
         return
     shop_name = (owner_data.get("shop_name") or "Shop").replace(" ", "_")
-    filename = f"Visbl_{shop_name}_Record.pdf"
+    filename = f"MaijiAI_{shop_name}_Record.pdf"
     send_document(
         to=phone,
         media_id=media_id,
         filename=filename,
         caption=(
-            "Here is your Visbl shop record. 📋\n\n"
+            "Here is your shop record. 📋\n\n"
             "Keep this document safe - it is your proof of stock."
         ),
     )
@@ -1867,7 +2130,7 @@ async def _daily_ask_input_type(phone: str):
                 ],
             }
         ],
-        footer_text="Visbl · Daily record · Type *cancel* to stop",
+        footer_text="Maiji AI · Daily record · Type *cancel* to stop",
     )
     session = state.sessions.get(phone, {})
     session["step"] = "DAILY_AWAITING_INPUT_TYPE"
@@ -1928,7 +2191,7 @@ async def _daily_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "daily_voice", "title": "🎤 Try again"},
                 {"id": "daily_text", "title": "✍️ Type instead"},
             ],
-            footer_text="Visbl · Type *cancel* to stop",
+            footer_text="Maiji AI · Type *cancel* to stop",
         )
         session["step"] = "DAILY_AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -1949,7 +2212,7 @@ async def _daily_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "daily_voice", "title": "🎤 Try again"},
                 {"id": "daily_text", "title": "✍️ Type instead"},
             ],
-            footer_text="Visbl · Type *cancel* to stop",
+            footer_text="Maiji AI · Type *cancel* to stop",
         )
         session["step"] = "DAILY_AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -1962,7 +2225,7 @@ async def _daily_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "daily_voice", "title": "🎤 Try again"},
                 {"id": "daily_text", "title": "✍️ Type instead"},
             ],
-            footer_text="Visbl · Type *cancel* to stop",
+            footer_text="Maiji AI · Type *cancel* to stop",
         )
         session["step"] = "DAILY_AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -1989,7 +2252,7 @@ async def _daily_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "daily_voice", "title": "🎤 Try again"},
                 {"id": "daily_text", "title": "✍️ Type instead"},
             ],
-            footer_text="Visbl · Type *cancel* to stop",
+            footer_text="Maiji AI · Type *cancel* to stop",
         )
         session["step"] = "DAILY_AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -2007,7 +2270,7 @@ async def _daily_handle_voice(phone: str, message: dict, session: dict):
                 {"id": "daily_voice", "title": "🎤 Try again"},
                 {"id": "daily_text", "title": "✍️ Type instead"},
             ],
-            footer_text="Visbl · Type *cancel* to stop",
+            footer_text="Maiji AI · Type *cancel* to stop",
         )
         session["step"] = "DAILY_AWAITING_INPUT_TYPE"
         state.sessions[phone] = session
@@ -2188,10 +2451,10 @@ async def _daily_process_images(phone: str, messages: list):
         )
         return
 
-    # ── CHANGED: pull context before calling Claude ──
+    # Pull context before calling Gemini
     previous_logs, record_strength, restart_cap = _get_owner_context(phone)
 
-    result = await step_4_parse_inventory_with_claude(
+    result = await step_4_parse_inventory_with_gemini(
         phone,
         image_b64s,
         previous_logs=previous_logs,
@@ -2264,10 +2527,10 @@ async def _daily_confirm_inventory(
         elif verification_status == "mismatch":
             badge = "⚠️ Something looks different"
         else:
-            badge = "📋 Recorded by Visbl AI"
+            badge = "📋 Recorded by Maiji AI"
 
         body = (
-            f"Visbl BUSINESS RECEIPT 🧾\n"
+            f"Maiji AI RECEIPT 🧾\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Date: {datetime.now().strftime('%d %b %Y')}\n\n"
             f"Stock recorded:\n{items_text}\n\n"
@@ -2295,7 +2558,7 @@ async def _daily_confirm_inventory(
             {"id": "daily_confirm", "title": "Yes, save it ✅"},
             {"id": "daily_edit", "title": "No, edit it"},
         ],
-        footer_text="Visbl · Daily record · Type *cancel* to stop",
+        footer_text="Maiji AI · Daily record · Type *cancel* to stop",
     )
     session = state.sessions.get(phone, {})
     session["step"] = "DAILY_AWAITING_CONFIRM"
@@ -2369,7 +2632,7 @@ async def _daily_save_inventory(phone: str, owner, inventory: list):
         send_text(
             phone,
             "Stock saved! ✅\n\n"
-            "Your record is building - see you tomorrow. 📋\n\n"
+            "Your record is building and helping you move closer to your goal. 🎯\n\n"
             "*LOG* anytime to update again.",
         )
 
@@ -2450,9 +2713,9 @@ def _send_main_menu(phone: str, greeting: str = ""):
                         "description": "Download your shop record",
                     },
                     {
-                        "id": "menu_activate",
-                        "title": "Activate Shield 🛡️",
-                        "description": "Start your protection",
+                        "id": "menu_goal",
+                        "title": "My Goal 🎯",
+                        "description": "Check your progress",
                     },
                     {
                         "id": "menu_delete",
@@ -2462,9 +2725,8 @@ def _send_main_menu(phone: str, greeting: str = ""):
                 ],
             }
         ],
-        footer_text="Visbl · Your shop record",
+        footer_text="Maiji AI · Your shop record",
     )
-
 
 def parse_inventory(raw: str):
     try:
@@ -2489,19 +2751,12 @@ async def parse_text_inventory(text: str) -> list:
     """
     logger.info("parse_text_inventory_start | text=%r", text[:50])
 
-    # 1. Try Regex first for simple structured lists (faster/cheaper)
-    # If it looks like a list "Item: 5", regex is fine.
-    # But for "I bought 5 shoes", regex might fail or be less robust.
-    # Actually, let's try LLM first for robustness with voice notes,
-    # unless it's a very clear list format.
-
     # Simple heuristic: if it contains newlines and colons, it might be a typed list
     if "\n" in text and ":" in text:
         regex_result = _parse_text_inventory_regex(text)
         if regex_result:
             return regex_result
 
-    # 2. Use Claude Haiku for natural language parsing
     system_prompt = """You are a stock inventory parser for a market trader.
     Extract items, quantities, and prices from the text.
 
@@ -2517,15 +2772,13 @@ async def parse_text_inventory(text: str) -> list:
     """
 
     try:
-        claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        response = await claude.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": text}],
+        raw = await _gemini_generate_content(
+            model=GEMINI_TEXT_MODEL,
+            user_parts=[{"text": text}],
+            system_prompt=system_prompt,
+            max_output_tokens=1024,
+            timeout=30.0,
         )
-
-        raw = response.content[0].text.strip()
         raw = re.sub(r"```json|```", "", raw).strip()
         data = json.loads(raw)
 
@@ -2536,7 +2789,6 @@ async def parse_text_inventory(text: str) -> list:
     except Exception:
         logger.exception("parse_text_llm_failed | falling_back_to_regex")
 
-    # 3. Fallback to regex
     return _parse_text_inventory_regex(text)
 
 

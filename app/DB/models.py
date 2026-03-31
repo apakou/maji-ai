@@ -85,3 +85,17 @@ class InventoryDeclaration(Base):
     total_stock_value_ghs = Column(Numeric(12, 2))  # The "Proof of Stock"
     item_breakdown_json = Column(Text)  # AI summary of categories
     generated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Goal(Base):
+    __tablename__ = "goals"
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("owners.id"), nullable=False)
+    goal_text = Column(Text)  # Raw user input, e.g. "Send son to ASHESI next year"
+    goal_category = Column(String)  # education, health, housing, business, other
+    target_amount_ghs = Column(Numeric(12, 2))  # e.g. 60000
+    monthly_required_ghs = Column(Numeric(12, 2))  # Calculated monthly savings needed
+    target_date = Column(String)  # Natural language, e.g. "next year", "December 2026"
+    progress_ghs = Column(Numeric(12, 2), default=0)  # Running total logged toward goal
+    is_active = Column(Integer, default=1)  # 1 = active, 0 = completed/archived
+    created_at = Column(DateTime, default=datetime.utcnow)

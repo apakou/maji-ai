@@ -10,5 +10,4 @@ Pillow
 fpdf2
 requests
 openai
-anthropic
 httpx

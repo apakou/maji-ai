@@ -24,8 +24,9 @@ from app.handlers.onboarding import (
     step_3_handle_photo,
     step_3_handle_voice,
     step_5_handle_flow_submission,
-    step_5b_handle_stock_value,
-    step_5c_handle_restart_cap,
+    step_5b_ask_monthly_revenue,
+    step_5b_handle_monthly_revenue,
+    step_5c_handle_goal_input,
 )
 from app.handlers.voice_transcriber import transcribe_voice_message
 from app.handlers.whatsapp_manager import (
@@ -63,7 +64,7 @@ async def root():
     img = img.convert("RGB")
     img = img.resize((800, int(img.height * 800 / img.width)))
     img.save("assets/greetings.jpg", "JPEG", quality=60, optimize=True)
-    return {"message": "Visbl is active!"}
+    return {"message": "Maiji AI is active!"}
 
 
 @app.get("/webhook")
@@ -358,17 +359,17 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             else:
                 send_text(phone, "Please type your correction as text.")
 
-        elif session["step"] == "AWAITING_CAPS_Q1":
+        elif session["step"] == "AWAITING_REVENUE":
             if msg_type != "text":
-                send_text(phone, "Please reply with a number. Example: *50000*")
+                send_text(phone, "Please reply with a number. Example: *3000*")
             else:
-                await step_5b_handle_stock_value(phone, incoming_text, session)
+                await step_5b_handle_monthly_revenue(phone, incoming_text, session)
 
-        elif session["step"] == "AWAITING_CAPS_Q2":
+        elif session["step"] == "AWAITING_GOAL_INPUT":
             if msg_type != "text":
-                send_text(phone, "Please reply with a number. Example: *10000*")
+                send_text(phone, "Please describe your goal in a message.")
             else:
-                await step_5c_handle_restart_cap(phone, incoming_text, session)
+                await step_5c_handle_goal_input(phone, incoming_text, session)
 
         elif session["step"] in ("AWAITING_PAYMENT_DECISION", "IDLE", "COMPLETE"):
             await onboarding.handle_existing_user(phone, message, None)
